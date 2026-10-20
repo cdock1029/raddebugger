@@ -12,6 +12,7 @@ R_D3D11_VShadKind_Rect,
 R_D3D11_VShadKind_Blur,
 R_D3D11_VShadKind_Mesh,
 R_D3D11_VShadKind_Geo3DComposite,
+R_D3D11_VShadKind_AlphaResolve,
 R_D3D11_VShadKind_COUNT,
 } R_D3D11_VShadKind;
 
@@ -21,6 +22,7 @@ R_D3D11_PShadKind_Rect,
 R_D3D11_PShadKind_Blur,
 R_D3D11_PShadKind_Mesh,
 R_D3D11_PShadKind_Geo3DComposite,
+R_D3D11_PShadKind_AlphaResolve,
 R_D3D11_PShadKind_COUNT,
 } R_D3D11_PShadKind;
 
@@ -234,6 +236,7 @@ str8_lit_comp(
 "  float4 src_clamp;\n"
 "  uint blur_count;\n"
 "  uint mask_corners;\n"
+"  uint preserve_alpha;\n"
 "}\n"
 "\n"
 "cbuffer Kernel : register(b1)\n"
@@ -263,9 +266,9 @@ str8_lit_comp(
 "}\n"
 "\n"
 "// The source holds only a padded copy of the blurred region; clamp taps to its valid pixel centers.\n"
-"float3 sample_src(float2 src_px)\n"
+"float4 sample_src(float2 src_px)\n"
 "{\n"
-"  return stage_t2d.Sample(stage_sampler, clamp(src_px, src_clamp.xy, src_clamp.zw) * src_texel_size).rgb;\n"
+"  return stage_t2d.Sample(stage_sampler, clamp(src_px, src_clamp.xy, src_clamp.zw) * src_texel_size);\n"
 "}\n"
 "\n"
 "//- rjf: vertex shader\n"
@@ -312,13 +315,15 @@ str8_lit_comp(
 "{\n"
 "  // rjf: blend weighted texture samples into color\n"
 "  float2 src_px = v2p.position.xy + src_offset;\n"
-"  float3 color = kernel[0].x * sample_src(src_px);\n"
+"  float4 color = kernel[0].x * sample_src(src_px);\n"
+"  float weight_sum = kernel[0].x;\n"
 "  for(uint i = 1; i < blur_count; i += 1)\n"
 "  {\n"
 "    float weight = kernel[i].x;\n"
 "    float offset = kernel[i].y;\n"
 "    color += weight * sample_src(src_px - offset * direction);\n"
 "    color += weight * sample_src(src_px + offset * direction);\n"
+"    weight_sum += 2 * weight;\n"
 "  }\n"
 "  \n"
 "  // rjf: sample for corners\n"
@@ -333,7 +338,16 @@ str8_lit_comp(
 "    }\n"
 "  }\n"
 "  \n"
-"  return float4(color, 1.f);\n"
+"  // The truncated kernel sums to slightly under 1; normalize so blurring opaque content keeps it opaque.\n"
+"  if(preserve_alpha)\n"
+"  {\n"
+"    color /= weight_sum;\n"
+"  }\n"
+"  else\n"
+"  {\n"
+"    color.a = 1.f;\n"
+"  }\n"
+"  return color;\n"
 "}\n"
 ""
 );
@@ -427,6 +441,59 @@ str8_lit_comp(
 "{\n"
 "  float4 final_color = stage_t2d.Sample(stage_sampler, v2p.texcoord);\n"
 "  return final_color;\n"
+"}\n"
+""
+);
+
+read_only global String8 r_d3d11_g_alpharesolve_shader_src =
+str8_lit_comp(
+""
+"\n"
+"struct CPU2Vertex\n"
+"{\n"
+"  uint vertex_id         : SV_VertexID;\n"
+"};\n"
+"\n"
+"struct Vertex2Pixel\n"
+"{\n"
+"  float4 position        : SV_POSITION;\n"
+"  float2 texcoord        : TEX;\n"
+"};\n"
+"\n"
+"Texture2D    stage_t2d     : register(t0);\n"
+"SamplerState stage_sampler : register(s0);\n"
+"\n"
+"//- vertex shader\n"
+"\n"
+"Vertex2Pixel\n"
+"vs_main(CPU2Vertex c2v)\n"
+"{\n"
+"  float2 vertex_position__modl = float2((c2v.vertex_id >> 1) ? 1.f : 0.f,\n"
+"                                        (c2v.vertex_id & 1)  ? 1.f : 0.f);\n"
+"  Vertex2Pixel v2p;\n"
+"  {\n"
+"    v2p.position = float4(2*vertex_position__modl.x - 1, 2*vertex_position__modl.y - 1, 0, 1);\n"
+"    v2p.texcoord = float2(vertex_position__modl.x, 1 - vertex_position__modl.y);\n"
+"  }\n"
+"  return v2p;\n"
+"}\n"
+"\n"
+"//- pixel shader\n"
+"\n"
+"float srgb_from_linear_f32(float x)\n"
+"{\n"
+"  return x < 0.0031308f ? 12.92f*x : 1.055f*pow(x, 1.f/2.4f)-0.055f;\n"
+"}\n"
+"\n"
+"float4\n"
+"ps_main(Vertex2Pixel v2p) : SV_TARGET\n"
+"{\n"
+"  float4 color = stage_t2d.Sample(stage_sampler, v2p.texcoord);\n"
+"  float alpha = saturate(color.a);\n"
+"  float3 straight = alpha > 0.f ? saturate(color.rgb/alpha) : float3(0, 0, 0);\n"
+"  return float4(float3(srgb_from_linear_f32(straight.r),\n"
+"                       srgb_from_linear_f32(straight.g),\n"
+"                       srgb_from_linear_f32(straight.b))*alpha, alpha);\n"
 "}\n"
 ""
 );

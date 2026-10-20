@@ -48,7 +48,8 @@ struct R_D3D11_Uniforms_BlurPass
   Vec4F32 src_clamp;       // valid source pixel-center range: min.xy, max.xy
   U32 blur_count;
   U32 mask_corners;
-  U8 _padding0_[168];
+  U32 preserve_alpha;
+  U8 _padding0_[164];
 };
 StaticAssert(sizeof(R_D3D11_Uniforms_BlurPass) % 256 == 0, NotAligned); // constant count/offset must be aligned to 256 bytes
 
@@ -123,9 +124,16 @@ struct R_D3D11_Window
   Vec2S32 geo3d_size;
   U64 geo3d_last_used_frame;
   
+  // alpha resolve scratch (Mica): grow-only copy of the window's region, released when unused for a while
+  ID3D11Texture2D *alpha_src;
+  ID3D11ShaderResourceView *alpha_src_srv;
+  Vec2S32 alpha_size;
+  U64 alpha_last_used_frame;
+  
   // rjf: last state
   U64 frame_index;
   Vec2S32 last_resolution;
+  B32 preserve_alpha; // Mica: the surface keeps per-pixel alpha so the backdrop shows through
 };
 
 typedef struct R_D3D11_FlushBuffer R_D3D11_FlushBuffer;
@@ -155,6 +163,7 @@ struct R_D3D11_State
   ID3D11RasterizerState1  *main_rasterizer;
   ID3D11BlendState        *main_blend_state;
   ID3D11BlendState        *surface_blend_state; // main blend, RGB writes only: the surface's alpha stays 1
+  ID3D11BlendState        *transparent_blend_state; // main blend, premultiplied-over alpha: for surfaces that preserve alpha
   ID3D11BlendState        *no_blend_state;
   ID3D11SamplerState      *samplers[R_Tex2DSampleKind_COUNT];
   ID3D11DepthStencilState *noop_depth_stencil;
@@ -202,6 +211,8 @@ internal Rng2S32 r_d3d11_window_rect_from_clip(Rng2F32 clip, Vec2S32 resolution)
 internal D3D11_RECT r_d3d11_surface_scissor_from_rect(R_D3D11_Window *wnd, Rng2S32 rect);
 internal void r_d3d11_window_release_blur_targets(R_D3D11_Window *wnd);
 internal void r_d3d11_window_release_geo3d_targets(R_D3D11_Window *wnd);
+internal void r_d3d11_window_release_alpha_targets(R_D3D11_Window *wnd);
+internal void r_d3d11_window_resolve_alpha(R_D3D11_Window *wnd);
 internal HRESULT r_d3d11_window_close_surface(WM_Window window, R_D3D11_Window *wnd);
 
 #endif // RENDER_D3D11_H

@@ -255,6 +255,93 @@ r_d3d11_window_release_geo3d_targets(R_D3D11_Window *wnd)
   wnd->geo3d_size = v2s32(0, 0);
 }
 
+internal void
+r_d3d11_window_release_alpha_targets(R_D3D11_Window *wnd)
+{
+  r_d3d11_release_and_zero(wnd->alpha_src_srv);
+  r_d3d11_release_and_zero(wnd->alpha_src);
+  wnd->alpha_size = v2s32(0, 0);
+}
+
+// Rewrites the window's region of the open surface from linear premultiplied color to sRGB color premultiplied
+// after encoding, which is what composition blends with the backdrop. Must be the last draw into the surface.
+internal void
+r_d3d11_window_resolve_alpha(R_D3D11_Window *wnd)
+{
+  ID3D11DeviceContext1 *d_ctx = r_d3d11_state->device_ctx;
+  Vec2S32 resolution = wnd->last_resolution;
+  POINT surface_offset = wnd->surface_offset;
+  
+  //- grow the scratch copy if needed
+  Vec2S32 scratch_size = r_d3d11_scratch_size_from_needed(wnd->alpha_size, resolution);
+  if(scratch_size.x != wnd->alpha_size.x || scratch_size.y != wnd->alpha_size.y)
+  {
+    r_d3d11_window_release_alpha_targets(wnd);
+    
+    // same typeless group as the surface, so the copy is legal; read through an sRGB view as linear
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc = {0};
+    srv_desc.Format              = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    srv_desc.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+    wnd->alpha_src = r_d3d11_target_alloc(scratch_size, DXGI_FORMAT_B8G8R8A8_TYPELESS, D3D11_BIND_SHADER_RESOURCE);
+    r_d3d11_check(r_d3d11_state->device->lpVtbl->CreateShaderResourceView(r_d3d11_state->device, (ID3D11Resource *)wnd->alpha_src, &srv_desc, &wnd->alpha_src_srv), "alpha resolve source view creation");
+    wnd->alpha_size = scratch_size;
+  }
+  if(resolution.x > wnd->alpha_size.x || resolution.y > wnd->alpha_size.y)
+  {
+    return;
+  }
+  wnd->alpha_last_used_frame = wnd->frame_index;
+  
+  //- copy the window's region out of the surface
+  {
+    D3D11_BOX box = {0};
+    box.left   = (UINT)surface_offset.x;
+    box.top    = (UINT)surface_offset.y;
+    box.front  = 0;
+    box.right  = (UINT)(surface_offset.x + resolution.x);
+    box.bottom = (UINT)(surface_offset.y + resolution.y);
+    box.back   = 1;
+    d_ctx->lpVtbl->CopySubresourceRegion(d_ctx, (ID3D11Resource *)wnd->alpha_src, 0, 0, 0, 0, (ID3D11Resource *)wnd->surface_texture, 0, &box);
+  }
+  
+  //- write back through a UNORM view: the shader does the sRGB encoding itself
+  ID3D11RenderTargetView *unorm_rtv = 0;
+  {
+    D3D11_RENDER_TARGET_VIEW_DESC desc = {0};
+    desc.Format        = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    r_d3d11_check(r_d3d11_state->device->lpVtbl->CreateRenderTargetView(r_d3d11_state->device, (ID3D11Resource *)wnd->surface_texture, &desc, &unorm_rtv), "alpha resolve target view creation");
+  }
+  if(unorm_rtv != 0)
+  {
+    ID3D11SamplerState *sampler = r_d3d11_state->samplers[R_Tex2DSampleKind_Nearest];
+    ID3D11VertexShader *vshad   = r_d3d11_state->vshads[R_D3D11_VShadKind_AlphaResolve];
+    ID3D11PixelShader *pshad    = r_d3d11_state->pshads[R_D3D11_PShadKind_AlphaResolve];
+    
+    // a viewport the size of the whole scratch copy maps its texels 1:1 onto the window's pixels
+    D3D11_VIEWPORT viewport = { (F32)surface_offset.x, (F32)surface_offset.y, (F32)wnd->alpha_size.x, (F32)wnd->alpha_size.y, 0.0f, 1.0f };
+    D3D11_RECT scissor = r_d3d11_surface_scissor_from_rect(wnd, r2s32p(0, 0, resolution.x, resolution.y));
+    d_ctx->lpVtbl->OMSetRenderTargets(d_ctx, 1, &unorm_rtv, 0);
+    d_ctx->lpVtbl->OMSetDepthStencilState(d_ctx, r_d3d11_state->noop_depth_stencil, 0);
+    d_ctx->lpVtbl->OMSetBlendState(d_ctx, r_d3d11_state->no_blend_state, 0, 0xffffffff);
+    d_ctx->lpVtbl->RSSetViewports(d_ctx, 1, &viewport);
+    d_ctx->lpVtbl->RSSetScissorRects(d_ctx, 1, &scissor);
+    d_ctx->lpVtbl->RSSetState(d_ctx, (ID3D11RasterizerState *)r_d3d11_state->main_rasterizer);
+    d_ctx->lpVtbl->IASetPrimitiveTopology(d_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    d_ctx->lpVtbl->IASetInputLayout(d_ctx, 0);
+    d_ctx->lpVtbl->VSSetShader(d_ctx, vshad, 0, 0);
+    d_ctx->lpVtbl->PSSetShader(d_ctx, pshad, 0, 0);
+    d_ctx->lpVtbl->PSSetShaderResources(d_ctx, 0, 1, &wnd->alpha_src_srv);
+    d_ctx->lpVtbl->PSSetSamplers(d_ctx, 0, 1, &sampler);
+    d_ctx->lpVtbl->Draw(d_ctx, 4, 0);
+    ID3D11ShaderResourceView *srv = 0;
+    d_ctx->lpVtbl->PSSetShaderResources(d_ctx, 0, 1, &srv);
+    d_ctx->lpVtbl->OMSetRenderTargets(d_ctx, 0, 0, 0);
+    unorm_rtv->lpVtbl->Release(unorm_rtv);
+  }
+}
+
 internal HRESULT
 r_d3d11_window_close_surface(WM_Window window, R_D3D11_Window *wnd)
 {
@@ -374,6 +461,9 @@ r_init(CmdLine *cmdln)
       desc.RenderTarget[0].RenderTargetWriteMask  = D3D11_COLOR_WRITE_ENABLE_ALL;
     }
     error = r_d3d11_state->device->lpVtbl->CreateBlendState(r_d3d11_state->device, &desc, &r_d3d11_state->main_blend_state);
+    desc.RenderTarget[0].DestBlendAlpha         = D3D11_BLEND_INV_SRC_ALPHA;
+    error = r_d3d11_state->device->lpVtbl->CreateBlendState(r_d3d11_state->device, &desc, &r_d3d11_state->transparent_blend_state);
+    desc.RenderTarget[0].DestBlendAlpha         = D3D11_BLEND_ZERO;
     desc.RenderTarget[0].RenderTargetWriteMask  = D3D11_COLOR_WRITE_ENABLE_RED|D3D11_COLOR_WRITE_ENABLE_GREEN|D3D11_COLOR_WRITE_ENABLE_BLUE;
     error = r_d3d11_state->device->lpVtbl->CreateBlendState(r_d3d11_state->device, &desc, &r_d3d11_state->surface_blend_state);
   }
@@ -642,6 +732,7 @@ r_window_unequip(WM_Window handle, R_Handle equip_handle)
     {
       r_d3d11_window_release_blur_targets(window);
       r_d3d11_window_release_geo3d_targets(window);
+      r_d3d11_window_release_alpha_targets(window);
       w32_comp_window_unequip(handle);
       window->generation += 1;
       SLLStackPush(r_d3d11_state->first_free_window, window);
@@ -941,6 +1032,7 @@ r_window_begin_frame(WM_Window window, R_Handle window_equip)
     R_D3D11_Window *wnd = r_d3d11_window_from_handle(window_equip);
     ID3D11DeviceContext1 *d_ctx = r_d3d11_state->device_ctx;
     wnd->frame_index += 1;
+    wnd->preserve_alpha = w32_wm_window_from_handle(window)->mica_enabled;
     
     //- rjf: get resolution
     Rng2F32 client_rect = wm_client_rect_from_window(window);
@@ -964,6 +1056,10 @@ r_window_begin_frame(WM_Window window, R_Handle window_equip)
     {
       r_d3d11_window_release_geo3d_targets(wnd);
     }
+    if(wnd->alpha_src != 0 && wnd->frame_index - wnd->alpha_last_used_frame > R_D3D11_SCRATCH_IDLE_FRAMES)
+    {
+      r_d3d11_window_release_alpha_targets(wnd);
+    }
     
     //- open the window's composition surface: every pass draws straight into it, until r_window_end_frame
     HRESULT error = S_OK;
@@ -980,8 +1076,8 @@ r_window_begin_frame(WM_Window window, R_Handle window_equip)
       }
       if(SUCCEEDED(error))
       {
-        // Opaque black. Only this window's region: the texture can be shared with other surfaces.
-        F32 clear_color[4] = {0, 0, 0, 1};
+        // Opaque black, or transparent when the backdrop shows through. Only this window's region: the texture can be shared with other surfaces.
+        F32 clear_color[4] = {0, 0, 0, wnd->preserve_alpha ? 0.f : 1.f};
         D3D11_RECT rect = r_d3d11_surface_scissor_from_rect(wnd, r2s32p(0, 0, resolution.x, resolution.y));
         d_ctx->lpVtbl->ClearView(d_ctx, (ID3D11View *)wnd->surface_rtv, clear_color, &rect, 1);
       }
@@ -1010,6 +1106,14 @@ r_window_end_frame(WM_Window window, R_Handle window_equip)
   {
     R_D3D11_Window *wnd = r_d3d11_window_from_handle(window_equip);
     ID3D11DeviceContext1 *d_ctx = r_d3d11_state->device_ctx;
+    
+    ////////////////////////////
+    //- Mica: convert the surface to what composition blends with the backdrop
+    //
+    if(wnd->surface_drawing && wnd->preserve_alpha)
+    {
+      r_d3d11_window_resolve_alpha(wnd);
+    }
     
     ////////////////////////////
     //- composed: end the surface update after dropping all references to this draw's target.
@@ -1044,6 +1148,7 @@ r_window_submit(WM_Window window, R_Handle window_equip, R_PassList *passes)
     Vec2S32 resolution = wnd->last_resolution;
     POINT surface_offset = wnd->surface_offset;
     D3D11_VIEWPORT surface_viewport = { (F32)surface_offset.x, (F32)surface_offset.y, (F32)resolution.x, (F32)resolution.y, 0.0f, 1.0f };
+    ID3D11BlendState *surface_blend_state = wnd->preserve_alpha ? r_d3d11_state->transparent_blend_state : r_d3d11_state->surface_blend_state;
     
     ////////////////////////////
     //- rjf: do passes
@@ -1132,7 +1237,7 @@ r_window_submit(WM_Window window, R_Handle window_equip, R_PassList *passes)
             // rjf: setup output merger
             d_ctx->lpVtbl->OMSetRenderTargets(d_ctx, 1, &wnd->surface_rtv, 0);
             d_ctx->lpVtbl->OMSetDepthStencilState(d_ctx, r_d3d11_state->noop_depth_stencil, 0);
-            d_ctx->lpVtbl->OMSetBlendState(d_ctx, r_d3d11_state->surface_blend_state, 0, 0xffffffff);
+            d_ctx->lpVtbl->OMSetBlendState(d_ctx, surface_blend_state, 0, 0xffffffff);
             
             // rjf: setup input assembly
             U32 stride = batches->bytes_per_inst;
@@ -1296,6 +1401,7 @@ r_window_submit(WM_Window window, R_Handle window_equip, R_PassList *passes)
             h_pass->src_clamp      = v4f32(0.5f, 0.5f, S_size.x - 0.5f, S_size.y - 0.5f);
             h_pass->blur_count     = sample_count;
             h_pass->mask_corners   = 0;
+            h_pass->preserve_alpha = wnd->preserve_alpha;
             
             // vertical: blur_mid -> surface; taps stay inside H's S-relative pixels
             R_D3D11_Uniforms_BlurPass *v_pass = &uniforms.passes[Axis2_Y];
@@ -1307,6 +1413,7 @@ r_window_submit(WM_Window window, R_Handle window_equip, R_PassList *passes)
             v_pass->src_clamp      = v4f32(H.x0 - S.x0 + 0.5f, H.y0 - S.y0 + 0.5f, H.x1 - S.x0 - 0.5f, H.y1 - S.y0 - 0.5f);
             v_pass->blur_count     = sample_count;
             v_pass->mask_corners   = 1;
+            v_pass->preserve_alpha = wnd->preserve_alpha;
             MemoryCopyArray(v_pass->corner_radii.v, params->corner_radii);
             
             D3D11_MAPPED_SUBRESOURCE sub_rsrc = {0};
@@ -1501,7 +1608,7 @@ r_window_submit(WM_Window window, R_Handle window_equip, R_PassList *passes)
             // rjf: setup output merger
             d_ctx->lpVtbl->OMSetRenderTargets(d_ctx, 1, &wnd->surface_rtv, 0);
             d_ctx->lpVtbl->OMSetDepthStencilState(d_ctx, r_d3d11_state->noop_depth_stencil, 0);
-            d_ctx->lpVtbl->OMSetBlendState(d_ctx, r_d3d11_state->surface_blend_state, 0, 0xffffffff);
+            d_ctx->lpVtbl->OMSetBlendState(d_ctx, surface_blend_state, 0, 0xffffffff);
             
             // rjf: set up rasterizer: a viewport the size of the whole target maps its texels 1:1 onto pixels
             D3D11_VIEWPORT composite_viewport =
